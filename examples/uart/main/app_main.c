@@ -1,16 +1,27 @@
 /*
- * i2s_mic UART streaming example — INMP441 -> ESP32 -> UART -> PC
+ * i2s_mic streaming example — INMP441 -> ESP32-C3 -> USB-Serial-JTAG -> PC
  *
- * Mirrors the handshake/framing pattern used by the JPEG-over-UART example:
- * boot at a slow handshake baud, wait for a trigger byte from the PC,
- * switch to a fast streaming baud, send a small binary header describing
- * the audio format, then stream raw PCM continuously.
+ * Wait for a trigger byte from the PC, send a small binary header
+ * describing the audio format, then stream raw PCM continuously — same
+ * overall shape as a UART-based handshake, but over the native
+ * USB-Serial-JTAG peripheral instead of a physical UART, since that's the
+ * only channel connected on boards (like most ESP32-C3 devkits) that have
+ * no separate USB-to-UART bridge chip. There's no baud rate to negotiate
+ * here (it's a real USB CDC endpoint), which simplifies the handshake
+ * versus a true-UART version.
  *
  * The wire format (sync bytes, magic, header layout, and the decision to
  * downconvert INMP441's 32-bit samples to 16-bit before sending) is owned
  * entirely by this example, not by the i2s_mic component. i2s_mic knows
- * nothing about UART, headers, or byte order — see the design document's
- * Section 10 ("component boundary" discussion) for why that split exists.
+ * nothing about USB, UART, headers, or byte order — see the design
+ * document's Section 10 ("component boundary" discussion) for why that
+ * split exists.
+ *
+ * If your board instead has a separate CP2102/CH340-style UART bridge
+ * wired to the physical UART0 pins (i.e. a second, distinct COM port shows
+ * up when you plug in), you can revert this file to talk to UART0 via
+ * driver/uart.h instead — the original approach works fine there, and the
+ * PC script's baud-switching logic is meant for exactly that case.
  *
  * Wiring (adjust GPIO_BCK/GPIO_WS/GPIO_DATA below for your board):
  *   INMP441 SCK  -> ESP32 GPIO_BCK
@@ -29,8 +40,7 @@
 #include <string.h>
 
 #include "esp_log.h"
-#include "driver/uart.h"
-#include "driver/uart_vfs.h"
+#include "driver/usb_serial_jtag.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -50,17 +60,13 @@
  * configure 32 here and downconvert to 16-bit ourselves before sending
  * over UART — see audio_sender_task(). */
 #define MIC_BITS_PER_SAMPLE   32
-#define WIRE_BITS_PER_SAMPLE  16   /* what actually goes out over UART, after conversion */
+#define WIRE_BITS_PER_SAMPLE  16   /* what actually goes out over the wire, after conversion */
 
 #define NUM_BUFS        4
 #define BUF_FRAMES      512                              /* frames per buffer */
 #define BUF_BYTES       (BUF_FRAMES * (MIC_BITS_PER_SAMPLE / 8))  /* mono: 1 sample == 1 frame */
 
-/* ---- UART configuration ------------------------------------------------ */
-#define HANDSHAKE_BAUD  115200
-#define STREAM_BAUD     921600
-
-#define UART_SENT 1   /* 1 = actually write PCM to UART, 0 = run the pipeline without transmitting (bring-up/debug) */
+#define STREAM_SENT 1   /* 1 = actually write PCM to the host, 0 = run the pipeline without transmitting (bring-up/debug) */
 
 /* ---- Wire header, read by the companion PC script ---------------------- */
 #define AUDIO_MAGIC 0xC0FFEE01u
@@ -168,20 +174,19 @@ static void audio_sender_task(void *arg)
         }
         size_t out_bytes = num_samples * sizeof(int16_t);
 
-#if UART_SENT
-        int written = uart_write_bytes(UART_NUM_0, (const char *)item.buf, out_bytes);
+#if STREAM_SENT
+        int written = usb_serial_jtag_write_bytes((const uint8_t *)item.buf, out_bytes, portMAX_DELAY);
         if (written < 0 || (size_t)written != out_bytes) {
             /* Logging is disabled once streaming starts (see
-             * uart_comm_init), so this is only informative during bring-up
-             * with UART_SENT temporarily left at 0, or over a JTAG console. */
-            ESP_LOGW(TAG, "short UART write: %d/%zu", written, out_bytes);
+             * host_comm_init), so this is only informative during bring-up
+             * with STREAM_SENT temporarily left at 0. */
+            ESP_LOGW(TAG, "short USB write: %d/%zu", written, out_bytes);
         }
 #endif
 
-        /* The buffer's contents have been fully copied into the UART
-         * driver's own TX ring buffer by the time uart_write_bytes()
-         * returns, so it's safe to return it to the pool now — no need to
-         * wait for uart_wait_tx_done(). */
+        /* The buffer's contents have been fully copied into the driver's
+         * own TX ring buffer by the time usb_serial_jtag_write_bytes()
+         * returns, so it's safe to return it to the pool now. */
         xQueueSend(s_free_q, &item.buf, portMAX_DELAY);
     }
 }
@@ -208,39 +213,32 @@ static void overflow_report_task(void *arg)
 }
 
 /* ------------------------------------------------------------------------
- * UART handshake (same pattern as the JPEG-over-UART example)
+ * Host handshake over USB-Serial-JTAG
  * ---------------------------------------------------------------------- */
 
-static void uart_comm_init(void)
+static void host_comm_init(void)
 {
-    const int tx_buf_size = BUF_BYTES * 4;
+    usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usb_cfg.rx_buffer_size = 256;
+    usb_cfg.tx_buffer_size = BUF_BYTES * 4;
+    ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
 
-    uart_driver_install(UART_NUM_0, 1024, tx_buf_size, 0, NULL, 0);
-    uart_vfs_dev_use_driver(0);
+    /* Note: this only installs the driver for our own reads/writes. The
+     * console's log output (ESP_LOGI etc.) keeps working over the same
+     * physical USB-Serial-JTAG cable via ESP-IDF's separate, lower-level
+     * console output path (that's what let you see "READY" below even
+     * before this driver was installed) — the two coexist by design; this
+     * is the standard pattern for adding bidirectional application I/O on
+     * top of a USB-Serial-JTAG console channel. */
 
     ESP_LOGI(TAG, "=== READY, waiting for trigger ===");
     fflush(stdout);
 
     uint8_t trigger = 0;
-    uart_read_bytes(UART_NUM_0, &trigger, 1, portMAX_DELAY);
+    usb_serial_jtag_read_bytes(&trigger, 1, portMAX_DELAY);
 
-    ESP_LOGI(TAG, "Trigger 0x%02X received - switching baud", trigger);
+    ESP_LOGI(TAG, "Trigger 0x%02X received", trigger);
     fflush(stdout);
-
-    vTaskDelay(pdMS_TO_TICKS(600));
-    uart_wait_tx_done(UART_NUM_0, portMAX_DELAY);
-
-    uart_config_t uart_cfg = {
-        .baud_rate  = STREAM_BAUD,
-        .data_bits  = UART_DATA_8_BITS,
-        .parity     = UART_PARITY_DISABLE,
-        .stop_bits  = UART_STOP_BITS_1,
-        .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_APB,
-    };
-    uart_param_config(UART_NUM_0, &uart_cfg);
-
-    vTaskDelay(pdMS_TO_TICKS(100));
 
     audio_header_t hdr = {
         .sync = {0xAA, 0xAA, 0xAA},
@@ -256,8 +254,7 @@ static void uart_comm_init(void)
     esp_log_level_set("*", ESP_LOG_NONE);
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    uart_write_bytes(UART_NUM_0, (const char *)&hdr, sizeof(hdr));
-    uart_wait_tx_done(UART_NUM_0, portMAX_DELAY);
+    usb_serial_jtag_write_bytes((const uint8_t *)&hdr, sizeof(hdr), portMAX_DELAY);
 }
 
 /* ------------------------------------------------------------------------
@@ -269,7 +266,7 @@ void app_main(void)
     s_free_q = xQueueCreate(NUM_BUFS, sizeof(uint8_t *));
     s_filled_q = xQueueCreate(NUM_BUFS, sizeof(filled_item_t));
 
-    uart_comm_init();
+    host_comm_init();
 
     i2s_mic_config_t cfg = {
         .sample_rate = SAMPLE_RATE,

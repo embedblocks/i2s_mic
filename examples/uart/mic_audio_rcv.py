@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
-mic_audio_rcv.py — companion PC-side script for the i2s_mic UART streaming
-example.
+mic_audio_rcv.py — companion PC-side script for the i2s_mic streaming
+example (USB-Serial-JTAG variant, for boards with no separate UART bridge
+chip — e.g. most ESP32-C3 devkits with a single USB port).
 
 The wire format (handshake sequence, sync bytes, header layout, 16-bit PCM
 payload) is defined jointly by this script and the ESP32 example's
 app_main.c. The i2s_mic *component* has no involvement in or knowledge of
 any of this — it only produces filled buffers inside the firmware.
+
+There's no baud rate to negotiate here: the ESP's USB-Serial-JTAG endpoint
+is a real USB CDC device, not a UART, so pyserial's `baudrate` is accepted
+but ignored by the firmware. If your board instead has a separate
+CP2102/CH340-style UART bridge (a second, distinct COM port appears when
+you plug in), use the true-UART version of this script/firmware instead,
+which does negotiate a faster baud rate for streaming.
 
 Usage:
     python mic_audio_rcv.py --port COM5 --mode record --out capture.wav
@@ -27,8 +35,7 @@ import serial
 
 SYNC_BYTE = 0xAA
 MAGIC = 0xC0FFEE01
-HANDSHAKE_BAUD = 115200
-STREAM_BAUD = 921600
+SERIAL_BAUD = 115200  # ignored by native USB-CDC; pyserial's API requires a value anyway
 CHUNK_BYTES = 4096  # serial read granularity; independent of the ESP's own DMA buffer size
 
 # audio_header_t on the wire: sync[3] + magic(u32) + sample_rate(u32)
@@ -153,7 +160,7 @@ def main():
     ap.add_argument("--out", default="capture.wav", help="Output WAV path for --mode record")
     args = ap.parse_args()
 
-    ser = serial.Serial(args.port, HANDSHAKE_BAUD, timeout=30)
+    ser = serial.Serial(args.port, SERIAL_BAUD, timeout=30)
     ser.dtr = False
     ser.rts = False
 
@@ -161,14 +168,7 @@ def main():
     ser.reset_input_buffer()
     send_trigger(ser)
 
-    # Must wait longer than the ESP's own 600ms delay before it reconfigures
-    # its UART baud rate, or we'll flip ours too early and desync.
-    time.sleep(0.7)
-    ser.reset_input_buffer()
-    ser.baudrate = STREAM_BAUD
-    time.sleep(0.1)
-
-    print(f"[3] Switched to {STREAM_BAUD} baud — waiting for header...")
+    print("[3] Waiting for header...")
     sample_rate, bits_per_sample, channel_count = read_header(ser)
     print(f"[4] Header: {sample_rate} Hz, {bits_per_sample}-bit, {channel_count} ch")
 
