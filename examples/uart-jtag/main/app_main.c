@@ -82,7 +82,8 @@
  * configure 32 here and downconvert to 16-bit ourselves before sending
  * over the wire — see audio_sender_task(). */
 #define MIC_BITS_PER_SAMPLE   32
-#define WIRE_BITS_PER_SAMPLE  16   /* what actually goes out over the wire, after conversion */
+#define WIRE_BITS_PER_SAMPLE  16   /* what actually goes out over the wire, after c
+onversion */
 
 /* We capture STEREO (2 slots) and keep only one — see the big comment at
  * the top of this file for why. KEEP_SLOT selects which of each
@@ -92,10 +93,12 @@
 #define MIC_CHANNEL_COUNT 2
 
 #define NUM_BUFS        4
-#define BUF_FRAMES      512    /* stereo frames per buffer (1 frame = 2 slots = both interleaved words) */
+#define BUF_FRAMES      512    /* stereo frames per buffer (1 frame = 2 slots = bot
+h interleaved words) */
 #define BUF_BYTES       (BUF_FRAMES * MIC_CHANNEL_COUNT * (MIC_BITS_PER_SAMPLE / 8))
 
-#define STREAM_SENT 1   /* 1 = actually write PCM to the host, 0 = run the pipeline without transmitting (bring-up/debug) */
+#define STREAM_SENT 1   /* 1 = actually write PCM to the host, 0 = run the pipeline
+ without transmitting (bring-up/debug) */
 
 /* ---- Wire header, read by the companion PC script ---------------------- */
 #define AUDIO_MAGIC 0xC0FFEE01u
@@ -202,7 +205,8 @@ static void audio_sender_task(void *arg)
          * the raw 32-bit samples untouched. */
         int32_t *src = (int32_t *)item.buf;
         int16_t *dst = (int16_t *)item.buf;
-        size_t num_frames = item.bytes_read / (MIC_CHANNEL_COUNT * sizeof(int32_t));
+        size_t num_frames = item.bytes_read / (MIC_CHANNEL_COUNT * sizeof(int32_t))
+;
         for (size_t i = 0; i < num_frames; i++) {
             dst[i] = (int16_t)(src[MIC_CHANNEL_COUNT * i + KEEP_SLOT] >> 16);
         }
@@ -235,11 +239,13 @@ static void overflow_report_task(void *arg)
         uint32_t ovf = s_last_overflow_count;
         uint32_t nobuf = s_last_no_buffer_count;
         if (ovf != last_ovf || nobuf != last_nobuf) {
-            /* Suppressed once streaming starts (esp_log_level_set("*", ESP_LOG_NONE)
+            /* Suppressed once streaming starts (esp_log_level_set("*", ESP_LOG_NON
+E)
              * below) so it never corrupts the PCM stream; useful during
              * bring-up over a separate console, or if you route logs
              * elsewhere (e.g. USB-CDC on boards with two UARTs/USB). */
-            ESP_LOGW(TAG, "drops so far: dma_overflow=%u no_buffer=%u", ovf, nobuf);
+            ESP_LOGW(TAG, "drops so far: dma_overflow=%u no_buffer=%u", ovf, nobuf)
+;
             last_ovf = ovf;
             last_nobuf = nobuf;
         }
@@ -252,7 +258,8 @@ static void overflow_report_task(void *arg)
 
 static void host_comm_init(void)
 {
-    usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    usb_serial_jtag_driver_config_t usb_cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT
+();
     usb_cfg.rx_buffer_size = 256;
     usb_cfg.tx_buffer_size = BUF_BYTES * 4;
     ESP_ERROR_CHECK(usb_serial_jtag_driver_install(&usb_cfg));
