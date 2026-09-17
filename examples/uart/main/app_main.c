@@ -27,14 +27,36 @@
  *   INMP441 SCK  -> ESP32 GPIO_BCK
  *   INMP441 WS   -> ESP32 GPIO_WS
  *   INMP441 SD   -> ESP32 GPIO_DATA
- *   INMP441 L/R  -> GND   (selects the channel this example's mono config expects)
+ *   INMP441 L/R  -> GND   (selects the LEFT slot, which is the one this
+ *                          example keeps — see the note on STEREO below)
  *   INMP441 VDD  -> 3.3V
  *   INMP441 GND  -> GND
  *
- * NOTE on L/R: ESP-IDF's Philips mono slot preset selects one fixed slot by
- * default. Which physical channel (left/right) that corresponds to can
- * differ across ESP-IDF versions — if you get silence, try tying L/R to
- * VDD instead of GND (or vice versa) before suspecting anything else.
+ * IMPORTANT — why this requests STEREO for a single mono mic:
+ * On at least one tested ESP32-C3 / ESP-IDF combination, requesting
+ * I2S_SLOT_MODE_MONO for RX did NOT produce the compact single-slot-per-
+ * frame stream ESP-IDF's docs describe for ESP32/S2 — the DMA buffer still
+ * contained both slots interleaved, with real audio in only one of every
+ * two 32-bit words (confirmed by analyzing a captured WAV: consecutive
+ * samples were essentially uncorrelated, while samples two apart were
+ * strongly correlated, and the discarded word's own spectrum was
+ * dominated by ~50 Hz mains hum rather than speech). Playing that
+ * [real, hum, real, hum, ...] stream back as one continuous mono signal
+ * produced a heavily distorted, low-pitched "growl."
+ *
+ * The fix used here sidesteps the ambiguity rather than depending on it:
+ * request STEREO explicitly (both slots, unambiguous), and discard the
+ * unwanted slot in audio_sender_task() below. This has been verified to
+ * fix the growl on the hardware/IDF combination it was diagnosed on; if
+ * you hit something similar on different hardware, this same de-interleave
+ * approach is the thing to reach for.
+ *
+ * NOTE on L/R: which physical slot (left/right) ends up first in the
+ * interleaved buffer can differ across ESP-IDF versions. This example
+ * assumes the real signal is in the first (even-indexed) word of each
+ * stereo pair, matching L/R tied to GND. If your recording is silent or
+ * hum-only after this fix, swap KEEP_SLOT below from 0 to 1 (or try VDD
+ * instead of GND on L/R) before suspecting anything else.
  */
 #include <stdint.h>
 #include <string.h>
@@ -58,13 +80,20 @@
 /* INMP441 outputs 24-bit samples MSB-justified in a 32-bit slot. i2s_mic
  * only supports 16 or 32-bit slots (24-bit is rejected at init()), so we
  * configure 32 here and downconvert to 16-bit ourselves before sending
- * over UART — see audio_sender_task(). */
+ * over the wire — see audio_sender_task(). */
 #define MIC_BITS_PER_SAMPLE   32
 #define WIRE_BITS_PER_SAMPLE  16   /* what actually goes out over the wire, after conversion */
 
+/* We capture STEREO (2 slots) and keep only one — see the big comment at
+ * the top of this file for why. KEEP_SLOT selects which of each
+ * interleaved pair is real audio: 0 = first/even word, 1 = second/odd
+ * word. Change this if your recording comes out silent or hum-only. */
+#define KEEP_SLOT       0
+#define MIC_CHANNEL_COUNT 2
+
 #define NUM_BUFS        4
-#define BUF_FRAMES      512                              /* frames per buffer */
-#define BUF_BYTES       (BUF_FRAMES * (MIC_BITS_PER_SAMPLE / 8))  /* mono: 1 sample == 1 frame */
+#define BUF_FRAMES      512    /* stereo frames per buffer (1 frame = 2 slots = both interleaved words) */
+#define BUF_BYTES       (BUF_FRAMES * MIC_CHANNEL_COUNT * (MIC_BITS_PER_SAMPLE / 8))
 
 #define STREAM_SENT 1   /* 1 = actually write PCM to the host, 0 = run the pipeline without transmitting (bring-up/debug) */
 
@@ -155,10 +184,15 @@ static void audio_sender_task(void *arg)
             continue;
         }
 
-        /* Downconvert INMP441's 32-bit samples to 16-bit PCM, in place.
-         * Safe as a forward in-place shrink: dst[i] (2 bytes) is always
-         * written before src[i+1] (starting at byte offset 4*(i+1)) is
-         * read, since 2*i < 4*(i+1) for every i >= 0.
+        /* Discard the unwanted interleaved slot, then downconvert INMP441's
+         * 32-bit samples to 16-bit PCM — both in place, in one pass.
+         *
+         * item.buf holds interleaved stereo frames: [slot0, slot1, slot0,
+         * slot1, ...] as int32_t words. We keep only src[2*i + KEEP_SLOT]
+         * from each frame. This is still safe as an in-place compaction:
+         * dst[i] (2 bytes, at byte offset 2*i) is always written strictly
+         * before the next frame we read from (starting at byte offset
+         * 8*(i+1)) is touched, since 2*i < 8*(i+1) for every i >= 0.
          *
          * The >> 16 keeps the sign and the most significant bits of the
          * sample. This is a starting point, not a calibrated value — if
@@ -168,11 +202,11 @@ static void audio_sender_task(void *arg)
          * the raw 32-bit samples untouched. */
         int32_t *src = (int32_t *)item.buf;
         int16_t *dst = (int16_t *)item.buf;
-        size_t num_samples = item.bytes_read / sizeof(int32_t);
-        for (size_t i = 0; i < num_samples; i++) {
-            dst[i] = (int16_t)(src[i] >> 16);
+        size_t num_frames = item.bytes_read / (MIC_CHANNEL_COUNT * sizeof(int32_t));
+        for (size_t i = 0; i < num_frames; i++) {
+            dst[i] = (int16_t)(src[MIC_CHANNEL_COUNT * i + KEEP_SLOT] >> 16);
         }
-        size_t out_bytes = num_samples * sizeof(int16_t);
+        size_t out_bytes = num_frames * sizeof(int16_t);
 
 #if STREAM_SENT
         int written = usb_serial_jtag_write_bytes((const uint8_t *)item.buf, out_bytes, portMAX_DELAY);
@@ -271,8 +305,8 @@ void app_main(void)
     i2s_mic_config_t cfg = {
         .sample_rate = SAMPLE_RATE,
         .bits_per_sample = MIC_BITS_PER_SAMPLE,
-        .channel_count = 1,
-        .slot_mode = I2S_SLOT_MODE_MONO,
+        .channel_count = MIC_CHANNEL_COUNT,
+        .slot_mode = I2S_SLOT_MODE_STEREO,
         .gpio_bck = GPIO_BCK,
         .gpio_ws = GPIO_WS,
         .gpio_data = GPIO_DATA,

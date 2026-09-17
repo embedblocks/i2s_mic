@@ -115,14 +115,20 @@ def run_record(ser, sample_rate, channel_count, out_path):
     wf.setframerate(sample_rate)
 
     print(f"[+] Recording to {out_path} — Ctrl+C to stop")
+    bytes_per_frame = 2 * channel_count
+    pending = bytearray()
     total = 0
     try:
         while True:
             chunk = ser.read(CHUNK_BYTES)
             if chunk:
-                wf.writeframes(chunk)
-                total += len(chunk)
-                print(f"\r  {total / 1024:.1f} KiB captured", end="", flush=True)
+                pending += chunk
+                usable_len = len(pending) - (len(pending) % bytes_per_frame)
+                if usable_len:
+                    wf.writeframes(bytes(pending[:usable_len]))
+                    total += usable_len
+                    del pending[:usable_len]
+                    print(f"\r  {total / 1024:.1f} KiB captured", end="", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
@@ -141,11 +147,25 @@ def run_play(ser, sample_rate, channel_count):
     stream = sd.RawOutputStream(samplerate=sample_rate, channels=channel_count, dtype="int16")
     stream.start()
     print("[+] Playing back live — Ctrl+C to stop")
+
+    # ser.read() can return a short, non-frame-aligned chunk (e.g. an odd
+    # number of bytes) once the read timeout elapses mid-sample. Writing a
+    # misaligned buffer to a RawOutputStream raises an exception that would
+    # otherwise silently kill this loop after the first short read — so we
+    # hold any leftover partial-frame byte over to be prepended to the next
+    # chunk instead of writing it immediately.
+    bytes_per_frame = 2 * channel_count  # 16-bit samples
+    pending = bytearray()
     try:
         while True:
             chunk = ser.read(CHUNK_BYTES)
-            if chunk:
-                stream.write(chunk)
+            if not chunk:
+                continue
+            pending += chunk
+            usable_len = len(pending) - (len(pending) % bytes_per_frame)
+            if usable_len:
+                stream.write(bytes(pending[:usable_len]))
+                del pending[:usable_len]
     except KeyboardInterrupt:
         pass
     finally:
