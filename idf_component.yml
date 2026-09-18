@@ -1,10 +1,10 @@
-version: "1.0.0"
+version: "0.1.2"
 description: >
   Task-free, ISR-driven I2S microphone component for ESP-IDF v6.0.x, built
   on the modern i2s_std driver. Application posts pre-allocated buffers;
   the component copies captured audio into them from ISR context and
   invokes an application callback. No internal FreeRTOS task.
-url: "https://github.com/YOUR_ORG/i2s_mic"
+url: "https://github.com/embedblocks/i2s_mic.git"
 dependencies:
   idf: ">=6.0,<6.1"
 targets:
