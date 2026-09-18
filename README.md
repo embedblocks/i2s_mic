@@ -204,10 +204,17 @@ Both example projects implement this workaround already (`MIC_CHANNEL_COUNT`,
 
 **Microphone compatibility is broader than the name suggests.** `i2s_mic`
 has no part-specific logic at all — it's a generic I2S receiver. It was
-developed and tested with an INMP441, and also confirmed working
-unmodified with an MSM261S4030H0. Any I2S digital MEMS mic using the same
-24-bit-in-32-bit Philips format (e.g. ICS-43434, SPH0645) should work the
-same way, though only the two listed parts have been directly tested.
+developed and directly tested with an **MSM261S4030H0**, which worked
+unmodified. INMP441 is used throughout this README and the examples as
+the reference part in wiring diagrams — it's the most widely documented
+I2S MEMS mic — but it has **not** actually been tested against this
+component; compatibility with it is expected, not confirmed, based on it
+sharing the same 24-bit-in-32-bit Philips format as the MSM261S4030H0.
+Other parts using that same format (e.g. ICS-43434, SPH0645) are likely
+compatible for the same reason, also untested. If you try the INMP441 (or
+any other part) and confirm it works, that's useful information worth
+updating this note with.
+
 
 **ISR callback rules are ordinary ISR rules.** `mic_buffer_ready_cb_t` and
 `mic_overflow_cb_t` must obey the same constraints as any ISR: no blocking

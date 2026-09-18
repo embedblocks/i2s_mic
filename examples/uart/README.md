@@ -16,9 +16,9 @@ USB-CDC endpoint is not.
 
 Captures audio from an I2S digital MEMS microphone using the `i2s_mic`
 component and streams it to a PC, which either plays it back in real time
-or records it to a WAV file. Developed and tested with an **INMP441**, and
-also confirmed working — unmodified — with an **MSM261S4030H0**. See
-"Microphone compatibility" below.
+or records it to a WAV file. Developed and directly tested with an
+**MSM261S4030H0**, which worked unmodified. See "Microphone compatibility"
+below.
 
 **Everything about the transport (handshake, sync bytes, header layout,
 16-bit downconversion) lives in this example, not in `i2s_mic` itself.**
@@ -28,9 +28,9 @@ The component only knows about I2S and filled buffers.
 
 | Mic pin | Example default (adjust for your board) |
 |---|---|
-| SCK (BCLK) | GPIO 16 |
-| WS (LRCLK) | GPIO 17 |
-| SD (DOUT)  | GPIO 18 |
+| SCK (BCLK) | GPIO 14 |
+| WS (LRCLK) | GPIO 15 |
+| SD (DOUT)  | GPIO 32 |
 | L/R        | GND |
 | VDD        | 3.3V |
 | GND        | GND |
@@ -45,15 +45,16 @@ pins (GPIO1 TX / GPIO3 RX) and the usual SPI-flash pin range.
 
 ## Microphone compatibility
 
-`i2s_mic` has no INMP441-specific logic at all — it's a generic I2S
-receiver that copies whatever the DMA hands it. Any I2S digital MEMS mic
-that speaks the standard Philips format with 24-bit samples MSB-justified
-in a 32-bit slot (the same layout the INMP441 uses) should work without
-code changes. This has been directly confirmed with an **MSM261S4030H0**
-in place of the INMP441, no changes needed. Other common parts using the
-same format (e.g. ICS-43434, SPH0645) are likely compatible too, though
-not directly tested here. INMP441 is used as the running example below
-simply because it's the most widely documented part in this space.
+`i2s_mic` has no part-specific logic at all — it's a generic I2S receiver
+that copies whatever the DMA hands it. This example was developed and
+directly tested with an **MSM261S4030H0**, which worked unmodified. The
+INMP441 is used as the reference part in the wiring diagram and text below
+simply because it's the most widely documented I2S MEMS mic — but it has
+**not** actually been tested against this example. Compatibility with it
+is expected, not confirmed, since it shares the same 24-bit-in-32-bit
+Philips format as the MSM261S4030H0. Other parts using that same format
+(e.g. ICS-43434, SPH0645) are likely compatible for the same reason, also
+untested.
 
 **On stereo capture:** this example requests STEREO and discards one slot
 (`KEEP_SLOT`), the same defensive pattern used in `i2s_mic_usb_jtag_example`
