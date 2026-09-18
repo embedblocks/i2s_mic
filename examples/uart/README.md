@@ -14,9 +14,11 @@ ESP32-C3/S3/C6 devkits), use the sibling example
 this one needs a real UART with a negotiable baud rate, which a native
 USB-CDC endpoint is not.
 
-Captures audio from an INMP441 MEMS microphone using the `i2s_mic`
+Captures audio from an I2S digital MEMS microphone using the `i2s_mic`
 component and streams it to a PC, which either plays it back in real time
-or records it to a WAV file.
+or records it to a WAV file. Developed and tested with an **INMP441**, and
+also confirmed working — unmodified — with an **MSM261S4030H0**. See
+"Microphone compatibility" below.
 
 **Everything about the transport (handshake, sync bytes, header layout,
 16-bit downconversion) lives in this example, not in `i2s_mic` itself.**
@@ -24,11 +26,11 @@ The component only knows about I2S and filled buffers.
 
 ## Wiring
 
-| INMP441 pin | Example default (adjust for your board) |
+| Mic pin | Example default (adjust for your board) |
 |---|---|
-| SCK (BCLK) | GPIO 14 |
-| WS (LRCLK) | GPIO 15 |
-| SD (DOUT)  | GPIO 32 |
+| SCK (BCLK) | GPIO 16 |
+| WS (LRCLK) | GPIO 17 |
+| SD (DOUT)  | GPIO 18 |
 | L/R        | GND |
 | VDD        | 3.3V |
 | GND        | GND |
@@ -40,6 +42,18 @@ hum/noise on its own.
 
 These GPIO defaults are classic-ESP32 numbers, chosen to avoid UART0's own
 pins (GPIO1 TX / GPIO3 RX) and the usual SPI-flash pin range.
+
+## Microphone compatibility
+
+`i2s_mic` has no INMP441-specific logic at all — it's a generic I2S
+receiver that copies whatever the DMA hands it. Any I2S digital MEMS mic
+that speaks the standard Philips format with 24-bit samples MSB-justified
+in a 32-bit slot (the same layout the INMP441 uses) should work without
+code changes. This has been directly confirmed with an **MSM261S4030H0**
+in place of the INMP441, no changes needed. Other common parts using the
+same format (e.g. ICS-43434, SPH0645) are likely compatible too, though
+not directly tested here. INMP441 is used as the running example below
+simply because it's the most widely documented part in this space.
 
 **On stereo capture:** this example requests STEREO and discards one slot
 (`KEEP_SLOT`), the same defensive pattern used in `i2s_mic_usb_jtag_example`
@@ -104,7 +118,7 @@ python pc/mic_audio_rcv.py --port COM5 --mode play
    and programming connection already use — via `uart_vfs_dev_use_driver()`
    to take over its full interrupt-driven driver. The handshake connects at
    a safe 115200 baud, waits for a validated trigger byte, then switches to
-   921600 for the actual streaming, matching the classic
+   460800 for the actual streaming, matching the classic
    "slow-handshake-then-fast-bulk-transfer" pattern.
 5. The trigger read loops until it sees the specific `TRIGGER_BYTE` value
    (`0xA5`) rather than accepting the first byte it gets. This matters
@@ -112,9 +126,16 @@ python pc/mic_audio_rcv.py --port COM5 --mode play
    accepted as the trigger prematurely, the PC script would be left
    waiting forever for a header that already went out before it connected.
 6. Bandwidth check: 16 kHz × 16-bit mono = 32,000 bytes/s of payload,
-   comfortably under UART @ 921600 baud's ~92,000 bytes/s raw capacity —
+   comfortably under UART @ 460800 baud's ~46,000 bytes/s raw capacity —
    `uart_write_bytes()`'s own blocking-when-the-TX-ring-is-full behavior is
    what ultimately paces the pipeline if the host ever falls behind.
+   460800 was chosen over the more common 921600 because several cheap
+   USB-serial bridge chips (CH340/CP2102 clones especially) don't reliably
+   honor 921600 on the PC/driver side — the ESP can transmit at that rate
+   just fine, but the PC's OS/driver may silently fail to switch to match
+   it, causing the two ends to talk past each other with zero visible
+   error. 460800 is much more consistently supported while still leaving
+   healthy headroom over the required 32,000 bytes/s.
 
 ## Known limitations of this example (not of `i2s_mic`)
 
