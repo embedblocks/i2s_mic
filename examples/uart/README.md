@@ -28,9 +28,9 @@ The component only knows about I2S and filled buffers.
 
 | Mic pin | Example default (adjust for your board) |
 |---|---|
-| SCK (BCLK) | GPIO 14 |
-| WS (LRCLK) | GPIO 15 |
-| SD (DOUT)  | GPIO 32 |
+| SCK (BCLK) | GPIO 16 |
+| WS (LRCLK) | GPIO 17 |
+| SD (DOUT)  | GPIO 18 |
 | L/R        | GND |
 | VDD        | 3.3V |
 | GND        | GND |
