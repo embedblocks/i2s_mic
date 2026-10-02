@@ -41,7 +41,7 @@ same 24-bit-in-32-bit layout — see Notes).
 
 | Chip | Status |
 |---|---|
-| ESP32 | Tested with 0.1.x |
+| ESP32 | Tested with 0.2.x |
 | ESP32-C3 | Tested with 0.1.x |
 | ESP32-S3 | Expected to work (`SOC_I2S_NUM >= 1`) |
 | ESP32-C6 | Expected to work (`SOC_I2S_NUM >= 1`) |
