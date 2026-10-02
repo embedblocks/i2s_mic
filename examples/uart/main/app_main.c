@@ -67,7 +67,6 @@
 #include "driver/uart_vfs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
 
 #include "i2s_mic.h"
 
@@ -100,8 +99,10 @@
 #define KEEP_SLOT       0
 #define MIC_CHANNEL_COUNT 2
 
-#define NUM_BUFS        4
-#define BUF_FRAMES      512    /* stereo frames per buffer (1 frame = 2 slots = both interleaved words) */
+#define DMA_BUF_COUNT   6      /* driver ring; it can hold DMA_BUF_COUNT - 1 unread buffers */
+#define BUF_FRAMES      480    /* stereo frames per DMA buffer = 30 ms at 16 kHz.
+                                * One DMA buffer is capped at 4092 bytes, so at
+                                * 8 bytes per stereo frame the most is 511. */
 #define BUF_BYTES       (BUF_FRAMES * MIC_CHANNEL_COUNT * (MIC_BITS_PER_SAMPLE / 8))
 
 #define STREAM_SENT 1   /* 1 = actually write PCM to UART, 0 = run the pipeline without transmitting (bring-up/debug) */
@@ -117,91 +118,44 @@ typedef struct {
     uint8_t  channel_count;
 } __attribute__((packed)) audio_header_t;
 
-/* ---- Buffer pool + inter-task handoff ----------------------------------
+/* ---- Capture buffer ----------------------------------------------------
  *
- * s_free_q holds buffers that are safe to (re-)post to i2s_mic.
- * s_filled_q holds buffers the ISR has already handed back, paired with
- * how many bytes of captured audio they hold, waiting for the sender task
- * to convert + transmit them.
- *
- * A buffer is only ever in exactly one of: posted-to-i2s_mic, in
- * s_filled_q, being processed by audio_sender_task, or in s_free_q. That
- * invariant is what makes it safe for the ISR to re-post a *different*
- * buffer than the one it just received, rather than the same one — see
- * mic_ready_cb() below.
+ * One buffer is enough: audio_sender_task reads a DMA buffer into it,
+ * converts and sends it, then reads the next. While it is busy, finished
+ * DMA buffers wait in the I2S driver's own queue (up to DMA_BUF_COUNT - 1
+ * of them, about 150 ms here). Only if the sender falls further behind
+ * than that does the driver drop audio, and i2s_mic_get_overflow_count()
+ * goes up.
  * ------------------------------------------------------------------- */
-static uint8_t s_bufs[NUM_BUFS][BUF_BYTES];
-
-typedef struct {
-    uint8_t *buf;
-    size_t   bytes_read;
-} filled_item_t;
-
-static QueueHandle_t s_free_q;
-static QueueHandle_t s_filled_q;
-
-static volatile uint32_t s_last_overflow_count = 0;
-static volatile uint32_t s_last_no_buffer_count = 0;
+static int32_t s_buf[BUF_FRAMES * MIC_CHANNEL_COUNT];
 
 /* ------------------------------------------------------------------------
- * i2s_mic callbacks (ISR context — see i2s_mic.h's rules before editing)
- * ---------------------------------------------------------------------- */
-
-static void IRAM_ATTR mic_ready_cb(uint8_t *buffer, size_t bytes_read, void *user_ctx)
-{
-    (void)user_ctx;
-    BaseType_t hp_woken = pdFALSE;
-
-    filled_item_t item = { .buf = buffer, .bytes_read = bytes_read };
-    xQueueSendFromISR(s_filled_q, &item, &hp_woken);
-
-    /* Re-post a free buffer from the pool (NOT the one we just received —
-     * audio_sender_task hasn't read it yet). Non-blocking: if the pool is
-     * empty right now, we simply don't re-post this cycle. That means one
-     * fewer buffer in flight going forward, which is exactly the
-     * best-effort backpressure the component is designed around: a slow
-     * consumer causes drops (reported via mic_overflow_cb below), not
-     * memory corruption. */
-    uint8_t *free_buf;
-    if (xQueueReceiveFromISR(s_free_q, &free_buf, &hp_woken) == pdTRUE) {
-        i2s_mic_request_buffer(free_buf, BUF_BYTES);
-    }
-
-    portYIELD_FROM_ISR(hp_woken);
-}
-
-static void mic_overflow_cb(uint32_t total_overflow_count, uint32_t total_no_buffer_count, void *user_ctx)
-{
-    (void)user_ctx;
-    /* ISR context: no logging here. Just record the latest counts; a
-     * low-priority task polls and logs them (see overflow_report_task). */
-    s_last_overflow_count = total_overflow_count;
-    s_last_no_buffer_count = total_no_buffer_count;
-}
-
-/* ------------------------------------------------------------------------
- * Ordinary tasks
+ * Tasks
  * ---------------------------------------------------------------------- */
 
 static void audio_sender_task(void *arg)
 {
     (void)arg;
-    filled_item_t item;
 
     while (1) {
-        if (xQueueReceive(s_filled_q, &item, portMAX_DELAY) != pdTRUE) {
+        size_t bytes_read = 0;
+        esp_err_t ret = i2s_mic_read(s_buf, BUF_BYTES, &bytes_read, portMAX_DELAY);
+        if (ret != ESP_OK) {
+            /* Only happens while capture is stopped; this example never
+             * stops, so just back off briefly and try again. */
+            vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
 
         /* Discard the unwanted interleaved slot, then downconvert INMP441's
          * 32-bit samples to 16-bit PCM — both in place, in one pass.
          *
-         * item.buf holds interleaved stereo frames: [slot0, slot1, slot0,
+         * s_buf holds interleaved stereo frames: [slot0, slot1, slot0,
          * slot1, ...] as int32_t words. We keep only src[2*i + KEEP_SLOT]
-         * from each frame. This is still safe as an in-place compaction:
-         * dst[i] (2 bytes, at byte offset 2*i) is always written strictly
-         * before the next frame we read from (starting at byte offset
-         * 8*(i+1)) is touched, since 2*i < 8*(i+1) for every i >= 0.
+         * from each frame. This is safe as an in-place compaction: dst[i]
+         * (2 bytes, at byte offset 2*i) is always written strictly before
+         * the next frame we read from (starting at byte offset 8*(i+1)) is
+         * touched, since 2*i < 8*(i+1) for every i >= 0.
          *
          * The >> 16 keeps the sign and the most significant bits of the
          * sample. This is a starting point, not a calibrated value — if
@@ -209,48 +163,43 @@ static void audio_sender_task(void *arg)
          * (e.g. >> 14 for more gain) or add explicit scaling here. This is
          * purely an application/transport choice; i2s_mic itself hands you
          * the raw 32-bit samples untouched. */
-        int32_t *src = (int32_t *)item.buf;
-        int16_t *dst = (int16_t *)item.buf;
-        size_t num_frames = item.bytes_read / (MIC_CHANNEL_COUNT * sizeof(int32_t));
+        const int32_t *src = s_buf;
+        int16_t *dst = (int16_t *)s_buf;
+        size_t num_frames = bytes_read / (MIC_CHANNEL_COUNT * sizeof(int32_t));
         for (size_t i = 0; i < num_frames; i++) {
             dst[i] = (int16_t)(src[MIC_CHANNEL_COUNT * i + KEEP_SLOT] >> 16);
         }
         size_t out_bytes = num_frames * sizeof(int16_t);
 
 #if STREAM_SENT
-        int written = uart_write_bytes(UART_NUM_0, (const char *)item.buf, out_bytes);
+        int written = uart_write_bytes(UART_NUM_0, (const char *)s_buf, out_bytes);
         if (written < 0 || (size_t)written != out_bytes) {
             /* Logging is disabled once streaming starts (see
              * host_comm_init), so this is only informative during bring-up
              * with STREAM_SENT temporarily left at 0. */
-            ESP_LOGW(TAG, "short UART write: %d/%zu", written, out_bytes);
+            ESP_LOGW(TAG, "short UART write: %d/%u", written, (unsigned)out_bytes);
         }
+#else
+        (void)out_bytes;
 #endif
-
-        /* The buffer's contents have been fully copied into UART0's own TX
-         * ring buffer by the time uart_write_bytes() returns, so it's safe
-         * to return it to the pool now — no need to wait for
-         * uart_wait_tx_done(). */
-        xQueueSend(s_free_q, &item.buf, portMAX_DELAY);
     }
 }
 
 static void overflow_report_task(void *arg)
 {
     (void)arg;
-    uint32_t last_ovf = 0, last_nobuf = 0;
+    uint32_t last = 0;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(2000));
-        uint32_t ovf = s_last_overflow_count;
-        uint32_t nobuf = s_last_no_buffer_count;
-        if (ovf != last_ovf || nobuf != last_nobuf) {
-            /* Suppressed once streaming starts (esp_log_level_set("*", ESP_LOG_NONE)
-             * below) so it never corrupts the PCM stream. Useful during
-             * bring-up, before the header/stream phase begins. */
-            ESP_LOGW(TAG, "drops so far: dma_overflow=%u no_buffer=%u", ovf, nobuf);
-            last_ovf = ovf;
-            last_nobuf = nobuf;
+        uint32_t lost = i2s_mic_get_overflow_count();
+        if (lost != last) {
+            /* Suppressed once streaming starts (esp_log_level_set("*",
+             * ESP_LOG_NONE) in host_comm_init) so it never corrupts the PCM
+             * stream. Useful during bring-up with STREAM_SENT set to 0. */
+            ESP_LOGW(TAG, "audio lost so far: %u buffers (%u ms)",
+                     (unsigned)lost, (unsigned)(lost * BUF_FRAMES * 1000u / SAMPLE_RATE));
+            last = lost;
         }
     }
 }
@@ -316,9 +265,6 @@ static void host_comm_init(void)
 
 void app_main(void)
 {
-    s_free_q = xQueueCreate(NUM_BUFS, sizeof(uint8_t *));
-    s_filled_q = xQueueCreate(NUM_BUFS, sizeof(filled_item_t));
-
     host_comm_init();
 
     i2s_mic_config_t cfg = {
@@ -330,28 +276,13 @@ void app_main(void)
         .gpio_ws = GPIO_WS,
         .gpio_data = GPIO_DATA,
         .port = I2S_NUM_0,
-        .dma_buffer_count = 6,
+        .dma_buffer_count = DMA_BUF_COUNT,
         .dma_buffer_size = BUF_BYTES,
-        .max_pending_buffers = NUM_BUFS,
-        .cb = mic_ready_cb,
-        .overflow_cb = mic_overflow_cb,
-        .user_ctx = NULL,
     };
 
     ESP_ERROR_CHECK(i2s_mic_init(&cfg));
+    ESP_ERROR_CHECK(i2s_mic_start());
 
     xTaskCreate(audio_sender_task, "audio_sender", 4096, NULL, 5, NULL);
     xTaskCreate(overflow_report_task, "ovf_report", 2048, NULL, 1, NULL);
-
-    /* Post every buffer up front; the free pool starts empty and refills
-     * as audio_sender_task finishes with each buffer. */
-    for (int i = 0; i < NUM_BUFS; i++) {
-        ESP_ERROR_CHECK(i2s_mic_request_buffer(s_bufs[i], BUF_BYTES));
-    }
-
-    ESP_ERROR_CHECK(i2s_mic_start());
-
-    while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
 }

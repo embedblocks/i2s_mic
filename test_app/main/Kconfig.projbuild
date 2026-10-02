@@ -1,0 +1,11 @@
+menu "i2s_mic test app"
+
+    config I2S_MIC_TEST_APP_INTERACTIVE
+        bool "Show the Unity menu instead of running every test"
+        default n
+        help
+            Off: every test runs on boot and a summary is printed. On: the
+            Unity menu appears on the serial monitor so you can pick tests
+            by number or tag (e.g. [flow]).
+
+endmenu

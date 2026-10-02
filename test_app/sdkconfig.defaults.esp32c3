@@ -1,0 +1,7 @@
+# ESP32-C3: same pins as i2s_mic's uart-jtag and loopback examples.
+CONFIG_I2S_MIC_TEST_GPIO_BCK=7
+CONFIG_I2S_MIC_TEST_GPIO_WS=8
+CONFIG_I2S_MIC_TEST_GPIO_DATA=9
+
+# Console over the native USB-Serial-JTAG cable on boards without a UART bridge.
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y

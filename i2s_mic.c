@@ -1,99 +1,110 @@
 /*
  * i2s_mic — implementation.
  *
- * See include/i2s_mic.h and the design/implementation-specification
- * documents for the contract this file implements. Section references in
- * comments below refer to the implementation specification unless noted
- * otherwise.
+ * The component is a thin wrapper around ESP-IDF's i2s_channel_read().
+ * All buffering is the driver's own: finished DMA buffers wait in the
+ * driver's internal queue (dma_buffer_count - 1 entries) until the
+ * application reads them. The only ISR code here is a one-line counter in
+ * on_recv_q_ovf, which the driver calls when that queue is full and the
+ * oldest unread buffer is discarded, i.e. real audio loss.
  *
- * Two distinct synchronization primitives are used, and must not be
- * confused (spec Section 2):
+ * Driver behaviour this file depends on (ESP-IDF release/v6.0,
+ * components/esp_driver_i2s/i2s_common.c):
  *
- *   1. `s_mic.lifecycle_mutex` — an ordinary FreeRTOS mutex guarding the
- *      public lifecycle state and its transitions. Only ever touched from
- *      task context (init/start/stop/deinit are never called from an ISR).
+ *   1. i2s_channel_read() takes a binary semaphore, then loops while the
+ *      channel state is RUNNING. If i2s_channel_disable() changes the state
+ *      mid-read, the loop ends and the function returns ESP_OK with fewer
+ *      bytes than requested (possibly 0). It returns ESP_ERR_TIMEOUT only
+ *      when its queue wait expires, and ESP_ERR_INVALID_STATE when it cannot
+ *      take the semaphore within the timeout.
+ *   2. i2s_channel_disable() sets the state to READY, then waits (forever)
+ *      for an in-progress read to release the semaphore, and keeps it.
+ *      Only i2s_channel_enable() gives it back. A read that starts after
+ *      disable() has finished therefore blocks until the next enable(), or
+ *      until its own timeout.
+ *   3. i2s_channel_enable() empties the RX queue.
+ *   4. One DMA buffer is capped (4092 bytes on most targets). A larger
+ *      request is silently shrunk, with only a log warning.
  *
- *   2. `s_mic.spinlock` — a dual-context-safe critical section
- *      (portENTER_CRITICAL_SAFE / portENTER_CRITICAL_ISR) guarding
- *      `is_running`, `stopping`, `in_flight`, the overflow counters, and
- *      the pending-buffer queue's own bookkeeping. This is touched from
- *      both ISR and task context.
+ * How i2s_mic_read() stays correct while stop() runs on another task:
+ *
+ *   - Point 1: the result is checked after the call. ESP_OK only counts as
+ *     success when the full buffer was copied; a short ESP_OK means the
+ *     channel was stopped.
+ *   - Point 2: the caller's timeout is never passed to the driver directly.
+ *     The read waits in slices of about two buffer periods and re-checks
+ *     s_mic.running between slices. stop() clears running before it
+ *     disables the channel, so a reader always returns within one slice of
+ *     stop(), whatever timeout it asked for.
+ *   - Each read is exactly one DMA buffer. The driver copies one buffer at a
+ *     time and only times out before copying, so a timed-out slice has
+ *     consumed nothing and is safe to retry, and no partial buffer is ever
+ *     left half-delivered.
+ *
+ * No lock is held across the driver call, so stop() is never blocked by
+ * this wrapper; it only waits for the driver's own in-progress copy.
  */
 #include <string.h>
-#include <stdlib.h>
 
 #include "i2s_mic.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
+#include "esp_attr.h"
 #include "esp_log.h"
+#include "driver/i2s_common.h"
 
 static const char *TAG = "i2s_mic";
+
+/* Lower bound for one wait slice, so very short DMA buffers don't turn the
+ * read loop into a busy poll. */
+#define I2S_MIC_MIN_SLICE_MS 20
 
 typedef enum {
     MIC_STATE_UNINITIALIZED = 0,
     MIC_STATE_INITIALIZED,
     MIC_STATE_RUNNING,
-} mic_lifecycle_state_t;
+} mic_state_t;
 
 typedef struct {
-    uint8_t *buffer;
-    size_t len;
-} pending_slot_t;
+    /* Guards `state` transitions to/from UNINITIALIZED and `reader_active`,
+     * so deinit() and a starting read can't interleave. */
+    portMUX_TYPE mux;
 
-typedef struct {
-    /* --- Lifecycle (guarded by lifecycle_mutex; task context only) --- */
-    SemaphoreHandle_t lifecycle_mutex;
-    mic_lifecycle_state_t state;
+    volatile mic_state_t state;
+    volatile bool running;        /* cleared by stop() before disabling */
+    volatile bool reader_active;  /* a task is inside i2s_mic_read() */
+    volatile uint32_t overflow_count;
 
-    /* Set once by init() after everything below is fully constructed;
-     * cleared once by deinit() before it frees anything. Deliberately an
-     * ordinary, unsynchronized flag — see spec Section 2's note on why
-     * request_buffer()'s UNINITIALIZED check must not use either lock. */
-    volatile bool initialized_flag;
-
-    /* --- ISR-safe state (guarded by spinlock) --- */
-    portMUX_TYPE spinlock;
-    volatile bool is_running;
-    volatile bool stopping;
-    volatile int in_flight;
-
-    pending_slot_t *queue;   /* fixed-size array, allocated once at init() */
-    int queue_cap;           /* == max_pending_buffers; fixed after init() */
-    int queue_head;
-    int queue_count;
-
-    uint32_t total_overflow_count;
-    uint32_t total_no_buffer_count;
-
-    /* --- Effectively read-only after init(), before deinit() --- */
-    size_t dma_buffer_size;
-    mic_buffer_ready_cb_t cb;
-    mic_overflow_cb_t overflow_cb;
-    void *user_ctx;
-    i2s_chan_handle_t rx_handle;
+    i2s_chan_handle_t rx;
+    size_t buf_size;              /* actual bytes per DMA buffer */
+    uint32_t slice_ms;            /* one wait slice inside i2s_mic_read() */
 } i2s_mic_ctx_t;
 
 static i2s_mic_ctx_t s_mic = {
-    .spinlock = portMUX_INITIALIZER_UNLOCKED,
+    .mux = portMUX_INITIALIZER_UNLOCKED,
+    .state = MIC_STATE_UNINITIALIZED,
 };
 
-/* Forward declarations deliberately omit IRAM_ATTR: applying the attribute
- * to both a forward declaration and its definition creates two distinct
- * IRAM section-placement requests for the same symbol, which GCC rejects
- * under -Werror=attributes. IRAM_ATTR is applied once, on the definitions
- * below, which is sufficient to place the functions in IRAM. */
-static bool mic_on_recv(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx);
-static bool mic_on_recv_q_ovf(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx);
+/* Called by the driver from its RX ISR when its queue of finished buffers
+ * is full and it has just discarded the oldest one. That buffer was never
+ * read: one buffer of real audio loss. */
+static bool IRAM_ATTR mic_on_recv_q_ovf(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx)
+{
+    (void)handle;
+    (void)event;
+    (void)user_ctx;
+    s_mic.overflow_count++;
+    return false;
+}
 
 /* ------------------------------------------------------------------------
- * init / deinit / start / stop
+ * Lifecycle
  * ---------------------------------------------------------------------- */
 
-esp_err_t i2s_mic_init(i2s_mic_config_t *config)
+esp_err_t i2s_mic_init(const i2s_mic_config_t *config)
 {
-    if (config == NULL || config->cb == NULL) {
+    if (config == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
     if (config->bits_per_sample != 16 && config->bits_per_sample != 32) {
@@ -102,57 +113,43 @@ esp_err_t i2s_mic_init(i2s_mic_config_t *config)
     bool slot_mode_ok =
         (config->channel_count == 1 && config->slot_mode == I2S_SLOT_MODE_MONO) ||
         (config->channel_count == 2 && config->slot_mode == I2S_SLOT_MODE_STEREO);
-    if (!slot_mode_ok) {
+    if (!slot_mode_ok || config->sample_rate <= 0 || config->dma_buffer_count < 2) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (config->max_pending_buffers < 1 || config->max_pending_buffers > 16) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    /* slot_bit_width == bits_per_sample for the 16/32-bit cases this
-     * component supports (implementation spec Section 6/7). */
-    const int slot_bit_width = config->bits_per_sample;
-    const int bytes_per_frame = config->channel_count * (slot_bit_width / 8);
+    const int bytes_per_frame = config->channel_count * (config->bits_per_sample / 8);
     if (config->dma_buffer_size <= 0 || (config->dma_buffer_size % bytes_per_frame) != 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    const int dma_frame_num = config->dma_buffer_size / bytes_per_frame;
-
-    if (s_mic.lifecycle_mutex == NULL) {
-        s_mic.lifecycle_mutex = xSemaphoreCreateMutex();
-        if (s_mic.lifecycle_mutex == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
-
-    xSemaphoreTake(s_mic.lifecycle_mutex, portMAX_DELAY);
+    const int frames = config->dma_buffer_size / bytes_per_frame;
 
     if (s_mic.state != MIC_STATE_UNINITIALIZED) {
-        xSemaphoreGive(s_mic.lifecycle_mutex);
         return ESP_ERR_INVALID_STATE;
     }
 
-    pending_slot_t *queue = calloc((size_t)config->max_pending_buffers, sizeof(pending_slot_t));
-    if (queue == NULL) {
-        xSemaphoreGive(s_mic.lifecycle_mutex);
-        return ESP_ERR_NO_MEM;
-    }
-
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(config->port, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = config->dma_buffer_count;
-    chan_cfg.dma_frame_num = dma_frame_num;
+    chan_cfg.dma_desc_num = (uint32_t)config->dma_buffer_count;
+    chan_cfg.dma_frame_num = (uint32_t)frames;
 
-    i2s_chan_handle_t rx_handle = NULL;
-    esp_err_t ret = i2s_new_channel(&chan_cfg, NULL, &rx_handle);
+    i2s_chan_handle_t rx = NULL;
+    i2s_chan_info_t info;
+    size_t actual = 0;
+    uint32_t period_ms = 0;
+    uint32_t slice_ms = 0;
+    const i2s_event_callbacks_t cbs = {
+        .on_recv = NULL,
+        .on_recv_q_ovf = mic_on_recv_q_ovf,
+        .on_sent = NULL,
+        .on_send_q_ovf = NULL,
+    };
+
+    esp_err_t ret = i2s_new_channel(&chan_cfg, NULL, &rx);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(ret));
-        free(queue);
-        xSemaphoreGive(s_mic.lifecycle_mutex);
         return ret;
     }
 
     i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(config->sample_rate),
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG((uint32_t)config->sample_rate),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
             (i2s_data_bit_width_t)config->bits_per_sample, config->slot_mode),
         .gpio_cfg = {
@@ -169,324 +166,217 @@ esp_err_t i2s_mic_init(i2s_mic_config_t *config)
         },
     };
 
-    ret = i2s_channel_init_std_mode(rx_handle, &std_cfg);
+    ret = i2s_channel_init_std_mode(rx, &std_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(ret));
-        i2s_del_channel(rx_handle);
-        free(queue);
-        xSemaphoreGive(s_mic.lifecycle_mutex);
-        return ret;
+        goto fail;
     }
 
-    i2s_event_callbacks_t cbs = {
-        .on_recv = mic_on_recv,
-        .on_recv_q_ovf = mic_on_recv_q_ovf,
-        .on_sent = NULL,
-        .on_send_q_ovf = NULL,
-    };
-    ret = i2s_channel_register_event_callback(rx_handle, &cbs, NULL);
+    /* The driver silently shrinks a DMA buffer that exceeds its cap. Check
+     * what it actually allocated, so every read is exactly one buffer. */
+    ret = i2s_channel_get_info(rx, &info);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_get_info failed: %s", esp_err_to_name(ret));
+        goto fail;
+    }
+    actual = info.total_dma_buf_size / (uint32_t)config->dma_buffer_count;
+    if (actual != (size_t)config->dma_buffer_size) {
+        ESP_LOGE(TAG, "dma_buffer_size %d is too large for one DMA buffer; "
+                 "the driver allocated %u bytes (%u frames). Use at most that.",
+                 config->dma_buffer_size, (unsigned)actual,
+                 (unsigned)(actual / (size_t)bytes_per_frame));
+        ret = ESP_ERR_INVALID_SIZE;
+        goto fail;
+    }
+
+    ret = i2s_channel_register_event_callback(rx, &cbs, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s_channel_register_event_callback failed: %s", esp_err_to_name(ret));
-        i2s_del_channel(rx_handle);
-        free(queue);
-        xSemaphoreGive(s_mic.lifecycle_mutex);
-        return ret;
+        goto fail;
     }
 
-    s_mic.queue = queue;
-    s_mic.queue_cap = config->max_pending_buffers;
-    s_mic.queue_head = 0;
-    s_mic.queue_count = 0;
-    s_mic.dma_buffer_size = (size_t)config->dma_buffer_size;
-    s_mic.cb = config->cb;
-    s_mic.overflow_cb = config->overflow_cb;
-    s_mic.user_ctx = config->user_ctx;
-    s_mic.rx_handle = rx_handle;
-    s_mic.is_running = false;
-    s_mic.stopping = false;
-    s_mic.in_flight = 0;
-    s_mic.total_overflow_count = 0;
-    s_mic.total_no_buffer_count = 0;
+    /* One wait slice = two buffer periods, so a stopped reader returns
+     * promptly but a running one rarely wakes without data. */
+    period_ms = (uint32_t)(((uint64_t)frames * 1000 + (uint64_t)config->sample_rate - 1) /
+                                    (uint64_t)config->sample_rate);
+    slice_ms = 2 * period_ms;
+    if (slice_ms < I2S_MIC_MIN_SLICE_MS) {
+        slice_ms = I2S_MIC_MIN_SLICE_MS;
+    }
 
+    s_mic.rx = rx;
+    s_mic.buf_size = actual;
+    s_mic.slice_ms = slice_ms;
+    s_mic.overflow_count = 0;
+    s_mic.running = false;
+    s_mic.reader_active = false;
+
+    portENTER_CRITICAL(&s_mic.mux);
     s_mic.state = MIC_STATE_INITIALIZED;
-    /* Set last, after every other field above is fully constructed —
-     * request_buffer() reads this without a lock (spec Section 2). */
-    s_mic.initialized_flag = true;
-
-    xSemaphoreGive(s_mic.lifecycle_mutex);
+    portEXIT_CRITICAL(&s_mic.mux);
     return ESP_OK;
+
+fail:
+    i2s_del_channel(rx);
+    return ret;
 }
 
 esp_err_t i2s_mic_deinit(void)
 {
-    if (s_mic.lifecycle_mutex == NULL) {
+    portENTER_CRITICAL(&s_mic.mux);
+    if (s_mic.state != MIC_STATE_INITIALIZED || s_mic.reader_active) {
+        portEXIT_CRITICAL(&s_mic.mux);
         return ESP_ERR_INVALID_STATE;
     }
-    xSemaphoreTake(s_mic.lifecycle_mutex, portMAX_DELAY);
+    /* From here no new read can start: i2s_mic_read() checks the state
+     * under the same lock before claiming the reader slot. */
+    s_mic.state = MIC_STATE_UNINITIALIZED;
+    portEXIT_CRITICAL(&s_mic.mux);
 
-    if (s_mic.state != MIC_STATE_INITIALIZED) {
-        xSemaphoreGive(s_mic.lifecycle_mutex);
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    /* Cleared before anything is freed — see spec Section 2. */
-    s_mic.initialized_flag = false;
-
-    esp_err_t ret = i2s_del_channel(s_mic.rx_handle);
+    esp_err_t ret = i2s_del_channel(s_mic.rx);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s_del_channel failed: %s", esp_err_to_name(ret));
     }
-
-    free(s_mic.queue);
-    s_mic.queue = NULL;
-    s_mic.queue_cap = 0;
-    s_mic.queue_head = 0;
-    s_mic.queue_count = 0;
-    s_mic.rx_handle = NULL;
-    s_mic.cb = NULL;
-    s_mic.overflow_cb = NULL;
-    s_mic.user_ctx = NULL;
-    s_mic.dma_buffer_size = 0;
-
-    s_mic.state = MIC_STATE_UNINITIALIZED;
-
-    xSemaphoreGive(s_mic.lifecycle_mutex);
+    s_mic.rx = NULL;
+    s_mic.buf_size = 0;
+    s_mic.slice_ms = 0;
     return ret;
 }
 
 esp_err_t i2s_mic_start(void)
 {
-    if (s_mic.lifecycle_mutex == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    xSemaphoreTake(s_mic.lifecycle_mutex, portMAX_DELAY);
-
     if (s_mic.state != MIC_STATE_INITIALIZED) {
-        xSemaphoreGive(s_mic.lifecycle_mutex);
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Reset per-run counters and mark running before enabling the channel,
-     * so the ISR never observes a stale/previous run's counts (spec
-     * Section 9's reset behavior). */
-    portENTER_CRITICAL(&s_mic.spinlock);
-    s_mic.total_overflow_count = 0;
-    s_mic.total_no_buffer_count = 0;
-    s_mic.in_flight = 0;
-    s_mic.is_running = true;
-    portEXIT_CRITICAL(&s_mic.spinlock);
+    /* The channel is disabled here, so the ISR can't touch the counter. */
+    s_mic.overflow_count = 0;
 
-    esp_err_t ret = i2s_channel_enable(s_mic.rx_handle);
+    /* enable() also empties the driver's queue: no stale audio. */
+    esp_err_t ret = i2s_channel_enable(s_mic.rx);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(ret));
-        portENTER_CRITICAL(&s_mic.spinlock);
-        s_mic.is_running = false;
-        portEXIT_CRITICAL(&s_mic.spinlock);
-        xSemaphoreGive(s_mic.lifecycle_mutex);
         return ret;
     }
 
+    s_mic.running = true;
     s_mic.state = MIC_STATE_RUNNING;
-
-    xSemaphoreGive(s_mic.lifecycle_mutex);
     return ESP_OK;
 }
 
 esp_err_t i2s_mic_stop(void)
 {
-    if (s_mic.lifecycle_mutex == NULL) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    /* Held for stop()'s entire execution — serializes against a second
-     * concurrent stop()/start() (spec Section 2/5). */
-    xSemaphoreTake(s_mic.lifecycle_mutex, portMAX_DELAY);
-
     if (s_mic.state != MIC_STATE_RUNNING) {
-        xSemaphoreGive(s_mic.lifecycle_mutex);
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Close the gate: no RX callback dispatch that checks is_running after
-     * this point can proceed, and request_buffer() starts rejecting via
-     * `stopping`. */
-    portENTER_CRITICAL(&s_mic.spinlock);
-    s_mic.is_running = false;
-    s_mic.stopping = true;
-    portEXIT_CRITICAL(&s_mic.spinlock);
+    /* Clear first: any reader between wait slices now returns
+     * ESP_ERR_INVALID_STATE instead of starting a new driver wait. */
+    s_mic.running = false;
 
-    esp_err_t ret = i2s_channel_disable(s_mic.rx_handle);
+    /* Waits for a driver copy already in progress (at most about one buffer
+     * period plus the reader's scheduling delay), then stops the DMA. */
+    esp_err_t ret = i2s_channel_disable(s_mic.rx);
     if (ret != ESP_OK) {
-        /* Not specified by the design/implementation documents. We still
-         * complete the wait + queue-clear below so the component's internal
-         * state stays consistent and future start()/stop() calls behave
-         * correctly, but we surface this esp_err_t to the caller unchanged
-         * per the general error-propagation rule (spec Section 11). */
         ESP_LOGE(TAG, "i2s_channel_disable failed: %s", esp_err_to_name(ret));
     }
 
-    /* Wait for every in-flight RX callback dispatch (on_recv or
-     * on_recv_q_ovf, including one currently inside the application's own
-     * callback) to finish. Unbounded wait, yielding between polls — spec
-     * Section 5, step 5. */
-    int count;
-    do {
-        portENTER_CRITICAL(&s_mic.spinlock);
-        count = s_mic.in_flight;
-        portEXIT_CRITICAL(&s_mic.spinlock);
-        if (count != 0) {
-            vTaskDelay(1);
-        }
-    } while (count != 0);
-
-    /* Single atomic critical-section entry: clear the queue and drop
-     * `stopping` together (spec Section 5, step 6). */
-    portENTER_CRITICAL(&s_mic.spinlock);
-    s_mic.queue_head = 0;
-    s_mic.queue_count = 0;
-    s_mic.stopping = false;
-    portEXIT_CRITICAL(&s_mic.spinlock);
-
-    /* Public state transition, guarded by the lifecycle mutex alone. */
     s_mic.state = MIC_STATE_INITIALIZED;
-
-    xSemaphoreGive(s_mic.lifecycle_mutex);
     return ret;
 }
 
 /* ------------------------------------------------------------------------
- * i2s_mic_request_buffer — dual-context-safe (task or ISR)
+ * Read
  * ---------------------------------------------------------------------- */
 
-esp_err_t IRAM_ATTR i2s_mic_request_buffer(uint8_t *buffer, size_t buffer_len)
+static esp_err_t read_one_buffer(void *dst, size_t len, uint32_t timeout_ms)
 {
-    /* Unsynchronized read by design — see spec Section 2. */
-    if (!s_mic.initialized_flag) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (buffer == NULL || buffer_len == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    /* dma_buffer_size / queue_cap are fixed for the lifetime of a given
-     * INITIALIZED/RUNNING period and only change under init()/deinit(),
-     * which the caller must not invoke concurrently with this call on the
-     * same instance (spec Section 2) — reading them here unsynchronized is
-     * therefore safe. */
-    if (buffer_len < s_mic.dma_buffer_size) {
-        return ESP_ERR_INVALID_SIZE;
-    }
+    const bool forever = (timeout_ms == (uint32_t)portMAX_DELAY);
+    const TickType_t t0 = xTaskGetTickCount();
 
-    esp_err_t ret;
+    for (;;) {
+        if (!s_mic.running) {
+            return ESP_ERR_INVALID_STATE;
+        }
 
-    portENTER_CRITICAL_SAFE(&s_mic.spinlock);
-    if (s_mic.stopping) {
-        ret = ESP_ERR_INVALID_STATE;
-    } else {
-        bool dup = false;
-        for (int i = 0; i < s_mic.queue_count; i++) {
-            int idx = (s_mic.queue_head + i) % s_mic.queue_cap;
-            if (s_mic.queue[idx].buffer == buffer) {
-                dup = true;
-                break;
+        uint32_t wait_ms = s_mic.slice_ms;
+        bool last_slice = false;
+        if (!forever) {
+            uint32_t elapsed_ms = (uint32_t)(xTaskGetTickCount() - t0) * portTICK_PERIOD_MS;
+            uint32_t remaining_ms = (elapsed_ms >= timeout_ms) ? 0 : timeout_ms - elapsed_ms;
+            if (remaining_ms <= wait_ms) {
+                wait_ms = remaining_ms;
+                last_slice = true;
             }
         }
-        if (dup) {
-            ret = ESP_ERR_INVALID_ARG;
-        } else if (s_mic.queue_count >= s_mic.queue_cap) {
-            ret = ESP_ERR_NO_MEM;
-        } else {
-            int tail = (s_mic.queue_head + s_mic.queue_count) % s_mic.queue_cap;
-            s_mic.queue[tail].buffer = buffer;
-            s_mic.queue[tail].len = buffer_len;
-            s_mic.queue_count++;
-            ret = ESP_OK;
+
+        size_t n = 0;
+        esp_err_t r = i2s_channel_read(s_mic.rx, dst, len, &n, wait_ms);
+
+        if (r == ESP_OK) {
+            /* A short ESP_OK (including 0 bytes) means the channel was
+             * stopped during the read. */
+            return (n == len) ? ESP_OK : ESP_ERR_INVALID_STATE;
+        }
+        if (r != ESP_ERR_TIMEOUT && r != ESP_ERR_INVALID_STATE) {
+            return r;
+        }
+
+        /* Timed-out or not-yet-enabled slice: nothing was consumed. */
+        if (!s_mic.running) {
+            return ESP_ERR_INVALID_STATE;
+        }
+        if (last_slice) {
+            return ESP_ERR_TIMEOUT;
         }
     }
-    portEXIT_CRITICAL_SAFE(&s_mic.spinlock);
+}
 
+esp_err_t i2s_mic_read(void *dst, size_t len, size_t *bytes_read, uint32_t timeout_ms)
+{
+    if (bytes_read) {
+        *bytes_read = 0;
+    }
+    if (dst == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Check the state and claim the single reader slot atomically, so
+     * deinit() can't delete the channel under a starting read. */
+    portENTER_CRITICAL(&s_mic.mux);
+    if (s_mic.state == MIC_STATE_UNINITIALIZED || s_mic.reader_active) {
+        portEXIT_CRITICAL(&s_mic.mux);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (len != s_mic.buf_size) {
+        portEXIT_CRITICAL(&s_mic.mux);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    s_mic.reader_active = true;
+    portEXIT_CRITICAL(&s_mic.mux);
+
+    esp_err_t ret = read_one_buffer(dst, len, timeout_ms);
+
+    portENTER_CRITICAL(&s_mic.mux);
+    s_mic.reader_active = false;
+    portEXIT_CRITICAL(&s_mic.mux);
+
+    if (ret == ESP_OK && bytes_read) {
+        *bytes_read = len;
+    }
     return ret;
 }
 
 /* ------------------------------------------------------------------------
- * ISR callbacks
+ * Queries
  * ---------------------------------------------------------------------- */
 
-static bool IRAM_ATTR mic_on_recv(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx)
+uint32_t i2s_mic_get_overflow_count(void)
 {
-    (void)handle;
-    (void)user_ctx;
-
-    uint8_t *dst = NULL;
-    size_t dst_len = 0;
-    bool have_buffer = false;
-    uint32_t ovf_snapshot = 0;
-    uint32_t nobuf_snapshot = 0;
-
-    portENTER_CRITICAL_ISR(&s_mic.spinlock);
-    if (!s_mic.is_running) {
-        portEXIT_CRITICAL_ISR(&s_mic.spinlock);
-        return false;
-    }
-
-    if (s_mic.queue_count > 0) {
-        pending_slot_t slot = s_mic.queue[s_mic.queue_head];
-        s_mic.queue_head = (s_mic.queue_head + 1) % s_mic.queue_cap;
-        s_mic.queue_count--;
-        dst = slot.buffer;
-        dst_len = slot.len;
-        have_buffer = true;
-    } else {
-        s_mic.total_no_buffer_count++;
-    }
-    ovf_snapshot = s_mic.total_overflow_count;
-    nobuf_snapshot = s_mic.total_no_buffer_count;
-    s_mic.in_flight++;
-    portEXIT_CRITICAL_ISR(&s_mic.spinlock);
-
-    if (have_buffer) {
-        size_t copy_len = (event->size < dst_len) ? event->size : dst_len;
-        /* ESP-IDF renamed this field from `data` to `dma_buf` (the old name
-         * is gone entirely as of v6.0, not just deprecated). */
-        memcpy(dst, event->dma_buf, copy_len);
-        s_mic.cb(dst, copy_len, s_mic.user_ctx);
-    } else if (s_mic.overflow_cb) {
-        s_mic.overflow_cb(ovf_snapshot, nobuf_snapshot, s_mic.user_ctx);
-    }
-
-    portENTER_CRITICAL_ISR(&s_mic.spinlock);
-    s_mic.in_flight--;
-    portEXIT_CRITICAL_ISR(&s_mic.spinlock);
-
-    return false;
+    return s_mic.overflow_count;
 }
 
-static bool IRAM_ATTR mic_on_recv_q_ovf(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx)
+size_t i2s_mic_get_buffer_size(void)
 {
-    (void)handle;
-    (void)event;
-    (void)user_ctx;
-
-    uint32_t ovf_snapshot;
-    uint32_t nobuf_snapshot;
-
-    portENTER_CRITICAL_ISR(&s_mic.spinlock);
-    if (!s_mic.is_running) {
-        portEXIT_CRITICAL_ISR(&s_mic.spinlock);
-        return false;
-    }
-    s_mic.total_overflow_count++;
-    ovf_snapshot = s_mic.total_overflow_count;
-    nobuf_snapshot = s_mic.total_no_buffer_count;
-    s_mic.in_flight++;
-    portEXIT_CRITICAL_ISR(&s_mic.spinlock);
-
-    if (s_mic.overflow_cb) {
-        s_mic.overflow_cb(ovf_snapshot, nobuf_snapshot, s_mic.user_ctx);
-    }
-
-    portENTER_CRITICAL_ISR(&s_mic.spinlock);
-    s_mic.in_flight--;
-    portEXIT_CRITICAL_ISR(&s_mic.spinlock);
-
-    return false;
+    return (s_mic.state == MIC_STATE_UNINITIALIZED) ? 0 : s_mic.buf_size;
 }

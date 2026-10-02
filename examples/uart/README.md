@@ -102,18 +102,20 @@ python pc/mic_audio_rcv.py --port COM5 --mode play
    samples — INMP441 outputs 24-bit audio MSB-justified in a 32-bit slot,
    and `i2s_mic` only supports 16- or 32-bit slots (24-bit is rejected at
    `init()`), so 32-bit is the correct choice there.
-2. Filled buffers are handed from the ISR callback to a FreeRTOS queue; a
-   worker task (`audio_sender_task`) keeps only `KEEP_SLOT` of each
-   interleaved stereo pair and downconverts that 32-bit sample to 16-bit
-   (`sample >> 16`) before writing it out over UART0. If your recordings
-   are too quiet or too loud, adjust the shift amount or add explicit gain
-   there — it's a one-line change and entirely independent of `i2s_mic`.
-3. The ISR **re-posts a different buffer from the pool**, not the one it
-   just delivered — that buffer is still awaiting conversion/transmission
-   by `audio_sender_task`. If the pool is briefly empty (consumer running
-   behind), the ISR simply skips re-posting for that cycle; `i2s_mic`
-   surfaces the resulting drop through `overflow_cb`, logged periodically
-   by `overflow_report_task` whenever logging is enabled (it's silenced
+2. A worker task (`audio_sender_task`) calls `i2s_mic_read()` in a loop.
+   Each call blocks until the I2S driver has a finished DMA buffer (30 ms
+   of audio here) and copies it into the task's own buffer. The task then
+   keeps only `KEEP_SLOT` of each interleaved stereo pair and downconverts
+   that 32-bit sample to 16-bit (`sample >> 16`) before writing it out over
+   UART0. If your recordings are too quiet or too loud, adjust the
+   shift amount or add explicit gain there — it's a one-line change and
+   entirely independent of `i2s_mic`.
+3. There is no buffer pool and no ISR code in the application. While the
+   task is busy sending, finished DMA buffers wait in the I2S driver's own
+   queue (up to `DMA_BUF_COUNT - 1` of them, about 150 ms). Only if the
+   task falls further behind than that does the driver drop audio; each
+   dropped buffer increments `i2s_mic_get_overflow_count()`, which
+   `overflow_report_task` logs whenever logging is enabled (it's silenced
    once the binary PCM stream starts, to avoid corrupting it).
 4. `host_comm_init()` reuses **UART0** — the same peripheral the console
    and programming connection already use — via `uart_vfs_dev_use_driver()`

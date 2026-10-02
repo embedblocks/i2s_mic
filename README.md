@@ -4,37 +4,36 @@
 ![Espressif Component Registry](https://img.shields.io/badge/Espressif-Component%20Registry-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Task-free, ISR-driven I2S microphone component for ESP-IDF, built on the
-modern `i2s_std` driver. Post application-owned buffers, get them back
-filled with captured audio via a callback — no internal FreeRTOS task, no
-DMA-owned pointers ever handed to your code, no hidden copies beyond the
-one from DMA into your buffer.
+A thin, transparent I2S microphone component for ESP-IDF, built on the
+modern `i2s_std` driver. It sets up the RX channel and gives you a
+blocking `i2s_mic_read()`. Your task reads one DMA buffer at a time, into
+your own memory, on your own schedule. If your task falls too far behind,
+the driver drops audio and `i2s_mic_get_overflow_count()` tells you how
+much.
 
 Works with any I2S digital MEMS microphone that speaks the standard
 Philips slot format (INMP441, MSM261S4030H0, and similar parts using the
-same 24-bit-in-32-bit layout — see the compatibility note under Notes).
+same 24-bit-in-32-bit layout — see Notes).
 
 ---
 
 ## Features
 
-* **No internal FreeRTOS task** — `mic_buffer_ready_cb_t` and
-  `mic_overflow_cb_t` run inline from the I2S driver's own ISR dispatch;
-  no extra task, no extra stack, no scheduling latency of its own
-* **Application-owned buffers** — you pre-allocate and post buffers with
-  `i2s_mic_request_buffer()`; the component copies captured audio into the
-  oldest posted buffer on each DMA completion and hands it back via
-  callback. It never hands you a DMA-owned pointer
-* **Dual overflow tracking** — ESP-IDF's own internal DMA queue overflow
-  and "no application buffer was posted in time" are tracked and reported
-  separately through `mic_overflow_cb_t`, so you know which failure mode
-  you're actually hitting
-* **Dual-context-safe posting** — `i2s_mic_request_buffer()` is safe to
-  call from an ordinary task or from inside the ISR callback itself, using
-  the same synchronization either way
-* **Zero heap allocation on the hot path** — buffers are entirely
-  caller-supplied; the only allocation is a small internal bookkeeping
-  array sized once at `init()`
+* **Read when you're ready** — `i2s_mic_read()` blocks until the next DMA
+  buffer is finished, then copies it into your buffer. No callbacks, no
+  ISR rules for your code: log, block and process normally.
+* **No hidden buffering** — finished buffers wait in the I2S driver's own
+  queue (`dma_buffer_count - 1` of them) until you read them. i2s_mic adds
+  no queue, no task and no locks of its own.
+* **One honest loss counter** — `i2s_mic_get_overflow_count()` counts DMA
+  buffers the driver discarded because your reader was too far behind.
+  It stays at 0 while you keep up.
+* **All-or-nothing reads** — each call returns a full buffer or nothing,
+  so no audio is ever half-delivered.
+* **Clean shutdown** — `i2s_mic_stop()` wakes a blocked reader within
+  about one buffer period, whatever timeout it passed.
+* **Checked DMA sizing** — `init()` rejects a buffer size the driver would
+  silently shrink, so the size you configure is the size you get.
 
 ---
 
@@ -42,40 +41,44 @@ same 24-bit-in-32-bit layout — see the compatibility note under Notes).
 
 | Chip | Status |
 |---|---|
-| ESP32 | Confirmed |
-| ESP32-C3 | Confirmed |
+| ESP32 | Tested with 0.1.x |
+| ESP32-C3 | Tested with 0.1.x |
 | ESP32-S3 | Expected to work (`SOC_I2S_NUM >= 1`) |
 | ESP32-C6 | Expected to work (`SOC_I2S_NUM >= 1`) |
 
 Any target with `SOC_I2S_NUM >= 1` should work via the standard driver;
-only the two listed above have been directly tested against this
-component's specific implementation.
+only the two listed above have been run on hardware, with the 0.1.x
+implementation. 0.2.0 uses only public driver calls
+(`i2s_channel_read()`, enable/disable, `on_recv_q_ovf`) and has not yet
+been through the hardware acceptance tests.
 
 ---
 
 ## Installation
 
 ```bash
-idf.py add-dependency "embedblocks/i2s_mic^0.1.3"
+idf.py add-dependency "embedblocks/i2s_mic^0.2.0"
 ```
 
 Or in `idf_component.yml`:
 
 ```yaml
 dependencies:
-  embedblocks/i2s_mic: "^0.1.3"
+  embedblocks/i2s_mic: "^0.2.0"
 ```
 
 ---
 
-## Supported Formats (V1)
+## Supported Formats
 
-- `bits_per_sample`: 16 or 32 only (24-bit is rejected — see "Implementation
-  notes" below for why).
+- `bits_per_sample`: 16 or 32 only (24-bit mics deliver their samples in a
+  32-bit slot: use 32).
 - Philips I2S standard slot format only (no MSB-justified/PCM/TDM, no MCLK,
   no signal inversion).
 - `I2S_ROLE_MASTER` only.
-- `max_pending_buffers` in `[1, 16]`.
+- `dma_buffer_size` must fit in one DMA buffer: at most 4092 bytes on most
+  targets (for example 511 stereo 32-bit frames, or 2046 mono 16-bit
+  frames).
 
 ---
 
@@ -84,37 +87,33 @@ dependencies:
 ```c
 #include "i2s_mic.h"
 
-#define NUM_BUFS   3
-#define BUF_BYTES  1024   // must equal dma_buffer_size below
+#define BUF_FRAMES  480                        // 30 ms at 16 kHz
+#define BUF_BYTES   (BUF_FRAMES * 2)           // mono, 16-bit
 
-static uint8_t s_bufs[NUM_BUFS][BUF_BYTES];
-static QueueHandle_t s_audio_q;
+static int16_t s_buf[BUF_FRAMES];
 
-static void IRAM_ATTR mic_ready(uint8_t *buffer, size_t bytes_read, void *ctx)
+static void audio_task(void *arg)
 {
-    // ISR context: hand off, don't process.
-    BaseType_t hp_task_woken = pdFALSE;
-    xQueueSendFromISR(s_audio_q, &buffer, &hp_task_woken);
-
-    // Re-post from the same pre-allocated pool (never a fresh allocation here).
-    i2s_mic_request_buffer(buffer, BUF_BYTES);
-
-    portYIELD_FROM_ISR(hp_task_woken);
-}
-
-static void mic_overflow(uint32_t total_overflow, uint32_t total_no_buffer, void *ctx)
-{
-    // ISR context — keep this as short as mic_ready.
+    size_t n;
+    while (1) {
+        esp_err_t ret = i2s_mic_read(s_buf, BUF_BYTES, &n, portMAX_DELAY);
+        if (ret == ESP_ERR_INVALID_STATE) {
+            break;                             // capture was stopped
+        }
+        if (ret != ESP_OK) {
+            continue;
+        }
+        // Ordinary task context: process, log, send over UART/network...
+    }
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
-    s_audio_q = xQueueCreate(NUM_BUFS, sizeof(uint8_t *));
-
     i2s_mic_config_t cfg = {
         .sample_rate = 16000,
         .bits_per_sample = 16,
-        .channel_count = 1,        // see "Mono RX caveat" below if
+        .channel_count = 1,               // see "Mono RX caveat" below if
         .slot_mode = I2S_SLOT_MODE_MONO,  // this doesn't behave as expected
         .gpio_bck = GPIO_NUM_4,
         .gpio_ws = GPIO_NUM_5,
@@ -122,28 +121,71 @@ void app_main(void)
         .port = I2S_NUM_0,
         .dma_buffer_count = 6,
         .dma_buffer_size = BUF_BYTES,
-        .max_pending_buffers = NUM_BUFS,
-        .cb = mic_ready,
-        .overflow_cb = mic_overflow,
-        .user_ctx = NULL,
     };
 
     ESP_ERROR_CHECK(i2s_mic_init(&cfg));
-
-    for (int i = 0; i < NUM_BUFS; i++) {
-        ESP_ERROR_CHECK(i2s_mic_request_buffer(s_bufs[i], BUF_BYTES));
-    }
-
     ESP_ERROR_CHECK(i2s_mic_start());
-
-    uint8_t *filled;
-    while (1) {
-        if (xQueueReceive(s_audio_q, &filled, portMAX_DELAY) == pdTRUE) {
-            // Ordinary task context: do the slow work here (UART, network, etc).
-        }
-    }
+    xTaskCreate(audio_task, "audio", 4096, NULL, 5, NULL);
 }
 ```
+
+### Read contract
+
+Every call reads exactly one DMA buffer: `len` must equal
+`i2s_mic_get_buffer_size()`.
+
+| Situation | Returns | `bytes_read` |
+|---|---|---|
+| Buffer read | `ESP_OK` | full buffer |
+| No buffer within `timeout_ms` | `ESP_ERR_TIMEOUT` | 0 |
+| Called while not running | `ESP_ERR_INVALID_STATE`, immediately | 0 |
+| `stop()` while waiting | `ESP_ERR_INVALID_STATE`, or `ESP_OK` with one last full buffer | 0 or full |
+| Another task already inside `i2s_mic_read()` | `ESP_ERR_INVALID_STATE` | 0 |
+| Wrong `len` | `ESP_ERR_INVALID_SIZE` | 0 |
+
+### Rules
+
+- **One reading task.** A second concurrent reader is rejected.
+- **Never suspend or delete the reading task while it is inside
+  `i2s_mic_read()`.** `i2s_mic_stop()` waits for the driver's in-progress
+  copy, so a frozen reader would freeze `stop()`.
+- **Give the reading task a priority above your processing**, so it keeps
+  up even when processing is busy.
+- **Call `init`/`start`/`stop`/`deinit` from one control task.** `stop()`
+  may run while another task is blocked in `i2s_mic_read()`; that is the
+  normal way to end capture.
+- **Treat any rise in the overflow count as "audio unreliable".**
+
+### Shutdown order
+
+1. Call `i2s_mic_stop()`. A blocked reader wakes within about one buffer
+   period plus its scheduling delay and gets either one last full buffer
+   or `ESP_ERR_INVALID_STATE`.
+2. The reading task sees `ESP_ERR_INVALID_STATE`, leaves its loop and
+   signals that it has exited (task notification, event group, ...).
+3. Wait for that signal, then call `i2s_mic_deinit()`. `deinit()` returns
+   `ESP_ERR_INVALID_STATE` while a read is still in progress.
+
+If the reading task is also the task that calls `stop()` (as in the
+loopback example), steps 2 and 3 are trivial.
+
+### How much delay is tolerated
+
+The driver holds up to `dma_buffer_count - 1` finished buffers for you.
+With `dma_buffer_count = 6` and 30 ms buffers, your reader can fall about
+150 ms behind, counted from the last time it caught up, before the driver
+starts dropping the oldest buffer. Raise `dma_buffer_count` for more
+headroom; each extra buffer costs `dma_buffer_size` bytes of DMA-capable
+RAM.
+
+### Data coherence
+
+The I2S driver has no lock between the DMA engine and the CPU copy. A
+reader that is already a full ring behind, and is then preempted for
+about one buffer period in the middle of its copy, can receive a buffer
+the DMA has started rewriting. No error is returned in that case, but the
+overflow count is already rising, which is why a rising count means
+"audio unreliable". i2s_mic does not promise untorn buffers.
 
 ---
 
@@ -153,9 +195,22 @@ void app_main(void)
 |---|---|---|---|
 | `examples/uart-jtag` | Native USB-Serial-JTAG | ESP32-C3/S3/C6 boards with no separate UART bridge chip | Single cable, no extra hardware |
 | `examples/uart` | UART0 (shared with console) | Classic ESP32 boards with a CP2102/CH340-style bridge chip | Single cable, no extra hardware |
+| `examples/loopback_example` | none (on-device) | ESP32, ESP32-C3 | Records with `i2s_mic`, plays back with `i2s_spk` |
 
-Both examples capture from an I2S mic and stream 16-bit PCM to a PC script
-that plays it back live or records it to a WAV file.
+The streaming examples capture from an I2S mic and stream 16-bit PCM to a
+PC script that plays it back live or records it to a WAV file.
+
+---
+
+## Testing
+
+| Folder | What it is | How to run |
+|---|---|---|
+| `test/` | Unity test component: 16 `TEST_CASE`s for the read contract, loss accounting and stop/start behaviour | Built by `test_app/`, or add it to any project's `EXTRA_COMPONENT_DIRS` |
+| `test_app/` | ESP-IDF project that runs every test on a board (no microphone needed) | `idf.py set-target esp32c3 build flash monitor` |
+| `test_host/` | PC simulation of the ESP-IDF v6.0 I2S driver, for the wrapper's race conditions | `make` |
+
+See `test_app/README.md` for wiring and how to read the results.
 
 ---
 
@@ -169,8 +224,8 @@ contained *both* I2S slots interleaved — every other 32-bit word was real
 microphone audio, and the words in between carried something else (in the
 diagnosed case, a spectrum dominated by ~50 Hz mains hum rather than
 audio, consistent with a floating/unused slot). `i2s_mic` faithfully copies
-whatever the DMA-completion event reports; it has no way to know the
-underlying slot content doesn't match what `channel_count = 1` implies.
+whatever the driver delivers; it has no way to know the underlying slot
+content doesn't match what `channel_count = 1` implies.
 
 This was diagnosed empirically from one board/IDF build via signal
 analysis of a captured recording (near-zero sample-to-sample
@@ -183,10 +238,10 @@ heavily distorted, low-pitched "growl" at otherwise-correct length):
 
 1. Reconfigure `i2s_mic_init()` for `channel_count = 2` /
    `I2S_SLOT_MODE_STEREO` instead of mono, and double `dma_buffer_size`
-   accordingly (the byte-accounting formula in `i2s_mic_config_t` already
-   handles this: `dma_buffer_size` must be an exact multiple of
-   `channel_count * (bits_per_sample / 8)`).
-2. In your `mic_buffer_ready_cb_t`, keep only every other 32-bit sample
+   accordingly (`dma_buffer_size` must be an exact multiple of
+   `channel_count * (bits_per_sample / 8)`, and must still fit in one DMA
+   buffer: at most 4092 bytes, which is 511 stereo 32-bit frames).
+2. After each `i2s_mic_read()`, keep only every other 32-bit sample
    (either the even-indexed or odd-indexed word of each pair — check both,
    the real signal should look like plausible audio and the discarded one
    should look like near-silence or narrowband noise) instead of treating
@@ -216,92 +271,41 @@ any other part) and confirm it works, that's useful information worth
 updating this note with.
 
 
-**ISR callback rules are ordinary ISR rules.** `mic_buffer_ready_cb_t` and
-`mic_overflow_cb_t` must obey the same constraints as any ISR: no blocking
-FreeRTOS calls without the `FromISR` suffix, no heap allocation, no I/O,
-no logging, no mutexes, return quickly.
+**DMA buffer size.** ESP-IDF caps one DMA buffer at 4092 bytes on most
+targets and silently shrinks a larger request. `i2s_mic_init()` checks
+the size the driver actually allocated and fails with
+`ESP_ERR_INVALID_SIZE` (logging the largest size that fits) instead of
+letting reads and your buffer sizes disagree.
 
-**`i2s_mic_request_buffer()` is dual-context-safe by design** — call it
-from a task or from inside the callback itself, both are supported with
-the same synchronization underneath.
-
----
-
-## Implementation Notes / Judgment Calls
-
-The design and implementation-specification documents this component was
-built from are unusually complete, but a few points were left open and
-required a decision during implementation. Each is called out in code
-comments at the relevant spot too:
-
-1. **`i2s_port_t` doesn't exist in ESP-IDF v6.0, and `REQUIRES driver` no
-   longer pulls in UART/I2S headers.** Since v5.3, ESP-IDF has been
-   splitting the monolithic `driver` component into per-peripheral
-   components (`esp_driver_uart`, `esp_driver_i2s`, `esp_driver_gpio`,
-   etc.); in v6.0, depending on just `driver` is no longer sufficient to
-   get `driver/uart.h` or `driver/i2s_std.h`. This component's
-   `CMakeLists.txt` requires `esp_driver_i2s` explicitly. Alongside that,
-   the legacy I2S driver was removed entirely in v6.0, taking the
-   `i2s_port_t` type with it — ESP-IDF now uses plain `int` for port
-   numbers (`I2S_NUM_0`, `I2S_NUM_1`, etc. are still defined as int-valued
-   constants). `i2s_mic_config_t::port` is typed `int` accordingly.
-   Similarly, `i2s_event_data_t`'s buffer pointer field was renamed from
-   `data` to `dma_buf` — this component uses `dma_buf`, which does **not**
-   exist prior to that rename. Building against an older ESP-IDF release
-   would require reverting all of the above (the `REQUIRES`, the `port`
-   type, and `dma_buf`) to their pre-v6.0 equivalents.
-
-2. **`i2s_mic_stop()` when `i2s_channel_disable()` itself fails.** Neither
-   document specifies whether to still complete the in-flight wait and
-   queue-clear in this case. This implementation always completes them
-   (so the component's internal bookkeeping — `is_running`, `stopping`,
-   the pending queue, the public lifecycle state — stays consistent for
-   future calls), while still propagating the original `esp_err_t` from
-   `i2s_channel_disable()` to the caller unchanged, per the general
-   error-propagation rule.
-
-3. **`IRAM_ATTR` placement.** The design document requires the ISR copy
-   path (and everything it calls, including `i2s_mic_request_buffer()`) to
-   live in IRAM *when* `CONFIG_I2S_ISR_IRAM_SAFE` is enabled. This
-   implementation tags `mic_on_recv`, `mic_on_recv_q_ovf`, and
-   `i2s_mic_request_buffer()` with `IRAM_ATTR` unconditionally, which is
-   correct in both configurations but permanently costs a small, fixed
-   amount of IRAM even when the Kconfig option is off. If IRAM is tight in
-   your project and you never enable `CONFIG_I2S_ISR_IRAM_SAFE`, these
-   three `IRAM_ATTR` tags can be removed. (Implementation detail: the
-   attribute is applied only at each function's *definition*, not on its
-   forward declaration — doing it in both places makes GCC treat them as
-   two different IRAM placement requests for the same symbol, which fails
-   under `-Werror=attributes`.)
-
-Everything else — the state machine, the two-lock model, the pending-buffer
-queue's FIFO/duplicate-detection/ISR-safety requirements, the overflow
-counter semantics, and the byte-accounting formula for `dma_buffer_size` —
-is implemented exactly as specified, with no invented behavior beyond
-those three points.
+**How the read stays safe during `stop()`.** `i2s_mic_read()` never passes
+your timeout straight to the driver. It waits in slices of about two
+buffer periods and re-checks whether capture is still running between
+slices, and it checks every driver result for a short read. That is what
+lets `stop()` end a read that passed `portMAX_DELAY`, and why a read
+interrupted by `stop()` never reports success with partial data.
 
 ---
 
 ## Known Limitations
 
-- Multi-instance / handle-based API is out of scope for V1 (singleton
-  only).
+- Singleton only; no handle-based multi-instance API.
 - MSB-justified/PCM/TDM slot formats, MCLK, and signal inversion are not
   supported.
-- 24-bit audio is not supported (`bits_per_sample` must be 16 or 32).
+- 24-bit slot width is not supported (`bits_per_sample` must be 16 or 32).
+- One DMA buffer per `i2s_mic_read()` call.
 - No coordination with a companion speaker component (e.g. automatic
   port-conflict detection on single-I2S-peripheral chips) — the
   application is responsible for correct port assignment.
-- No "no-copy" posting mode — every DMA completion copies into your
-  posted buffer once.
 
 ---
 
 ## Requirements
 
-- ESP-IDF v6.0.x (v6.0–v6.0.3 verified against the pinned header behavior
-  this component relies on; re-verify `i2s_channel_write`/`disable`/`enable`
-  semantics against any later v6.0.x patch before upgrading).
+- ESP-IDF v6.0.x. The driver behaviour this component relies on
+  (`i2s_channel_read()` return values, `i2s_channel_disable()` waiting for
+  an in-progress read, `i2s_channel_enable()` emptying the RX queue, the
+  `on_recv_q_ovf` callback) is documented at the top of `i2s_mic.c`;
+  re-check it before moving to a later ESP-IDF minor version.
 - A target with `SOC_I2S_NUM >= 1` (see Chip Support above).
 
 ---

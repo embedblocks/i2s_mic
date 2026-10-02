@@ -1,0 +1,18 @@
+# Unity's IDF runner (TEST_CASE, unity_run_all_tests) is on by default;
+# pinned here so the app doesn't depend on that default.
+CONFIG_UNITY_ENABLE_IDF_TEST_RUNNER=y
+
+# The tests only use 32-bit asserts, so they also work in projects that
+# leave this off. Enabled here so any 64-bit assert added later works.
+CONFIG_UNITY_ENABLE_64BIT=y
+
+# The CPU-load test deliberately keeps the idle task from running for 20 ms
+# at a time; the task watchdog would only add noise.
+CONFIG_ESP_TASK_WDT_EN=n
+
+# Unity runs in the main task; give it room.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# The tick rate is left at the ESP-IDF default (100 Hz), which is what most
+# projects use and where timeout rounding matters most. To also check a
+# 1 kHz tick, add CONFIG_FREERTOS_HZ=1000 here and rerun.
