@@ -18,3 +18,14 @@ files:
     - "test_app/**"
     - "test_host/**"
     - "examples/loopback_example/**"
+tags:
+  - i2s
+  - microphone
+  - mic
+  - audio
+  - mems
+  - inmp441
+  - msm261
+  - pdm-free
+  - recording
+  - dma
