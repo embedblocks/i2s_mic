@@ -15,10 +15,11 @@ targets:
 files:
   use_gitignore: true
   exclude:
-    - "test/**/**"
-    - "test_app/**/**"
-    - "test_host/**/**"
-    - "examples/loopback_example/**/**"
+    - ".git/**/*"
+    - "test/**/*"
+    - "test_app/**/*"
+    - "test_host/**/*"
+    - "examples/loopback_example/**/*"
 tags:
   - i2s
   - microphone
